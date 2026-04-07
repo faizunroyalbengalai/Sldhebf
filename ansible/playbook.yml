@@ -66,6 +66,45 @@
     - name: Reset SSH connection so group change takes effect
       meta: reset_connection
 
+    - name: Install PostgreSQL
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: yes
+      when: install_db | default('false') | string == 'true' and db_type | default('') == 'postgres'
+
+    - name: Start and enable PostgreSQL
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+      when: install_db | default('false') | string == 'true' and db_type | default('') == 'postgres'
+
+    - name: Set PostgreSQL auth to md5 (avoids SCRAM failures)
+      shell: |
+        HBA=$(sudo find /etc/postgresql -name pg_hba.conf | head -1)
+        sudo sed -i 's/scram-sha-256/md5/g' $HBA
+        sudo systemctl reload postgresql
+      become: yes
+      when: install_db | default('false') | string == 'true' and db_type | default('') == 'postgres'
+
+    - name: Create PostgreSQL database
+      shell: sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+      become: yes
+      when: install_db | default('false') | string == 'true' and db_type | default('') == 'postgres'
+
+    - name: Create PostgreSQL user
+      shell: sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+      become: yes
+      when: install_db | default('false') | string == 'true' and db_type | default('') == 'postgres'
+
+    - name: Grant PostgreSQL privileges
+      shell: sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+      become: yes
+      when: install_db | default('false') | string == 'true' and db_type | default('') == 'postgres'
+
     - name: Wipe old app directory
       file:
         path: "{{ app_dir }}"
@@ -87,17 +126,11 @@
     - name: Write .env file for container
       shell: |
         printf '' > {{ app_dir }}/.env
-        {% if spring_datasource_url is defined and spring_datasource_url %}
-        printf 'SPRING_DATASOURCE_URL=%s\n' '{{ spring_datasource_url }}' >> {{ app_dir }}/.env
-        printf 'SPRING_DATASOURCE_USERNAME=%s\n' '{{ spring_datasource_username | default('') }}' >> {{ app_dir }}/.env
-        printf 'SPRING_DATASOURCE_PASSWORD=%s\n' '{{ spring_datasource_password | default('') }}' >> {{ app_dir }}/.env
-        {% endif %}
-        {% if spring_data_mongodb_uri is defined and spring_data_mongodb_uri %}
-        printf 'SPRING_DATA_MONGODB_URI=%s\n' '{{ spring_data_mongodb_uri }}' >> {{ app_dir }}/.env
-        {% endif %}
-        {% if spring_profiles_active is defined and spring_profiles_active %}
-        printf 'SPRING_PROFILES_ACTIVE=%s\n' '{{ spring_profiles_active }}' >> {{ app_dir }}/.env
-        {% endif %}
+        [ -n "{{ spring_datasource_url | default('') }}" ] && printf 'SPRING_DATASOURCE_URL=%s\n' '{{ spring_datasource_url | default('') }}' >> {{ app_dir }}/.env || true
+        [ -n "{{ spring_datasource_username | default('') }}" ] && printf 'SPRING_DATASOURCE_USERNAME=%s\n' '{{ spring_datasource_username | default('') }}' >> {{ app_dir }}/.env || true
+        [ -n "{{ spring_datasource_password | default('') }}" ] && printf 'SPRING_DATASOURCE_PASSWORD=%s\n' '{{ spring_datasource_password | default('') }}' >> {{ app_dir }}/.env || true
+        [ -n "{{ spring_data_mongodb_uri | default('') }}" ] && printf 'SPRING_DATA_MONGODB_URI=%s\n' '{{ spring_data_mongodb_uri | default('') }}' >> {{ app_dir }}/.env || true
+        [ -n "{{ spring_profiles_active | default('') }}" ] && printf 'SPRING_PROFILES_ACTIVE=%s\n' '{{ spring_profiles_active | default('') }}' >> {{ app_dir }}/.env || true
 
     - name: Write Dockerfile for Spring Boot
       copy:
