@@ -164,7 +164,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: app-jar
-          path: ansible/jar/
+          path: ansible/files/
 
       - name: Write SSH private key
         run: |
