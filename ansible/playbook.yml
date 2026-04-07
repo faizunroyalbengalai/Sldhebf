@@ -1,0 +1,216 @@
+---
+- name: Deploy Spring Boot application in Docker
+  hosts: all
+  become: yes
+
+  vars:
+    app_dir: /opt/app
+    app_port: 8080
+    app_container_name: spring-app
+    java_version: "21"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - nginx
+        state: present
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable"
+        state: present
+
+    - name: Install Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Start and enable nginx
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Reset SSH connection so group change takes effect
+      meta: reset_connection
+
+    - name: Wipe old app directory
+      file:
+        path: "{{ app_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Recreate app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy all project files to server
+      copy:
+        src: ../
+        dest: "{{ app_dir }}/"
+        mode: '0755'
+
+    - name: Write .env file for container
+      shell: |
+        printf '' > {{ app_dir }}/.env
+        {% if spring_datasource_url is defined and spring_datasource_url %}
+        printf 'SPRING_DATASOURCE_URL=%s\n' '{{ spring_datasource_url }}' >> {{ app_dir }}/.env
+        printf 'SPRING_DATASOURCE_USERNAME=%s\n' '{{ spring_datasource_username | default('') }}' >> {{ app_dir }}/.env
+        printf 'SPRING_DATASOURCE_PASSWORD=%s\n' '{{ spring_datasource_password | default('') }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if spring_data_mongodb_uri is defined and spring_data_mongodb_uri %}
+        printf 'SPRING_DATA_MONGODB_URI=%s\n' '{{ spring_data_mongodb_uri }}' >> {{ app_dir }}/.env
+        {% endif %}
+        {% if spring_profiles_active is defined and spring_profiles_active %}
+        printf 'SPRING_PROFILES_ACTIVE=%s\n' '{{ spring_profiles_active }}' >> {{ app_dir }}/.env
+        {% endif %}
+
+    - name: Write Dockerfile for Spring Boot
+      copy:
+        dest: "{{ app_dir }}/Dockerfile"
+        mode: '0644'
+        content: |
+          FROM eclipse-temurin:21-jre
+          WORKDIR /app
+          COPY jar/*.jar app.jar
+          EXPOSE 8080
+          ENTRYPOINT ["java", "-jar", "app.jar"]
+
+    - name: Create jar directory in app dir
+      file:
+        path: "{{ app_dir }}/jar"
+        state: directory
+        mode: '0755'
+
+    - name: Stop existing container
+      shell: docker stop {{ app_container_name }} || true
+
+    - name: Remove existing container
+      shell: docker rm {{ app_container_name }} || true
+
+    - name: Remove old image to force rebuild
+      shell: docker rmi {{ app_container_name }}:latest || true
+
+    - name: Build Docker image
+      shell: docker build --no-cache -t {{ app_container_name }}:latest {{ app_dir }}/
+
+    - name: Run Docker container
+      shell: >
+        docker run -d
+        --name {{ app_container_name }}
+        --network host
+        --restart always
+        {% if spring_datasource_url is defined and spring_datasource_url %}
+        -e SPRING_DATASOURCE_URL='{{ spring_datasource_url }}'
+        -e SPRING_DATASOURCE_USERNAME='{{ spring_datasource_username | default('') }}'
+        -e SPRING_DATASOURCE_PASSWORD='{{ spring_datasource_password | default('') }}'
+        {% endif %}
+        {% if spring_data_mongodb_uri is defined and spring_data_mongodb_uri %}
+        -e SPRING_DATA_MONGODB_URI='{{ spring_data_mongodb_uri }}'
+        {% endif %}
+        {% if spring_profiles_active is defined and spring_profiles_active %}
+        -e SPRING_PROFILES_ACTIVE='{{ spring_profiles_active }}'
+        {% endif %}
+        {{ app_container_name }}:latest
+
+    - name: Configure nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/default
+        mode: '0644'
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_connect_timeout 60s;
+                  proxy_read_timeout 60s;
+              }
+          }
+
+    - name: Restart nginx to apply config
+      service:
+        name: nginx
+        state: restarted
+
+    - name: Wait for Spring Boot container to be ready
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 15
+        timeout: 120
+        state: started
+      ignore_errors: yes
+      register: port_wait
+
+    - name: Capture Docker logs if startup failed
+      command: docker logs --tail 100 {{ app_container_name }}
+      register: service_logs
+      when: port_wait is failed
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show Docker logs if startup failed
+      debug:
+        msg: "{{ service_logs.stdout_lines | default(service_logs.stderr_lines) }}"
+      when: port_wait is failed
+
+    - name: Fail with clear message if app did not start
+      fail:
+        msg: "Spring Boot did not start on port 8080. See docker logs output above."
+      when: port_wait is failed
+
+    - name: Report server IP
+      debug:
+        msg: "server_ip={{ ansible_host }}"
+
+    - name: Verify container is running
+      shell: docker ps --filter name={{ app_container_name }} --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'
+      register: container_check
+      retries: 3
+      delay: 5
+      until: container_check.stdout != ""
+      become: yes
+
+    - name: Report deployment success
+      debug:
+        msg: "Spring Boot deployed successfully. Live at http://{{ ansible_host }}/"
